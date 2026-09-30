@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Meu Álbum — Nuvem</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 :root{--bg:#f5f7fb;--panel:#fff;--text:#172033;--muted:#748096;--primary:#5b5ce2;--primary2:#7b61ff;--danger:#e74c3c;--line:#e6e9f0;--shadow:0 12px 35px rgba(24,32,56,.08)}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
@@ -55,7 +56,7 @@ button,input{font:inherit}button{cursor:pointer;border:0}
     <div class="nav-title">Pastas</div>
     <div id="folderList" class="folder-list"></div>
     <button id="newFolderBtn" class="new-folder">＋ Nova pasta</button>
-    <div class="account"><b id="accountEmail"></b><button id="logoutBtn" class="logout">Sair</button></div>
+    <div class="account"><b id="accountEmail"></b><button id="logoutBtn" class="logout">Sair</button><button id="driveBtn" class="logout" style="margin-left:8px">Conectar Drive</button></div>
   </aside>
   <main class="main">
     <div class="topbar">
@@ -87,12 +88,14 @@ button,input{font:inherit}button{cursor:pointer;border:0}
 /* COLOQUE AQUI OS DADOS DO SEU PROJETO SUPABASE */
 const SUPABASE_URL = "https://tbzcodouhqviofkjhjqp.supabase.co";
 const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_nztsKfIP2BqDpktTV-VMbQ_ojErJdvT";
-const BUCKET = "album-fotos";
+const GOOGLE_CLIENT_ID = "674098398184-me63taanaual37119935nijc3sb3pdvv.apps.googleusercontent.com";
+const GOOGLE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const DRIVE_ROOT_NAME = "Meu Álbum";
 
 const configured = !SUPABASE_URL.includes("COLE_") && !SUPABASE_PUBLISHABLE_KEY.includes("COLE_");
 const client = configured ? supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}}) : null;
 
-let currentUser=null,currentFolder="all",folders=[],photos=[];
+let currentUser=null,currentFolder="all",folders=[],photos=[],googleAccessToken=null,googleTokenClient=null,driveRootId=null;
 
 const $=id=>document.getElementById(id);
 function toast(msg){const t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(window._toast);window._toast=setTimeout(()=>t.classList.remove("show"),2600)}
@@ -101,6 +104,19 @@ function uid(){return crypto.randomUUID ? crypto.randomUUID() : Date.now()+"-"+M
 function showAuth(msg=""){ $("authScreen").classList.remove("hidden");$("appScreen").classList.add("hidden");$("authMsg").textContent=msg }
 function showApp(){ $("authScreen").classList.add("hidden");$("appScreen").classList.remove("hidden");$("accountEmail").textContent=currentUser.email||"" }
 function authError(e){return e?.message||"Não foi possível concluir a operação."}
+function driveReady(){return !!googleAccessToken}
+function setDriveButton(){const b=$("driveBtn");if(b)b.textContent=driveReady()?"Google Drive conectado":"Conectar Drive"}
+function requestDriveAccess(){
+  if(!window.google?.accounts?.oauth2)return toast("O Google ainda está carregando. Tente novamente em alguns segundos.");
+  if(!googleTokenClient){
+    googleTokenClient=google.accounts.oauth2.initTokenClient({client_id:GOOGLE_CLIENT_ID,scope:GOOGLE_SCOPE,callback:(resp)=>{
+      if(resp.error){toast("Não foi possível autorizar o Google Drive.");return}
+      googleAccessToken=resp.access_token;setDriveButton();toast("Google Drive conectado!");
+    }});
+  }
+  googleTokenClient.requestAccessToken({prompt:googleAccessToken?"":"consent"});
+}
+$("driveBtn").onclick=requestDriveAccess;
 
 $("showSignUpBtn").onclick=async()=>{
   const email=$("email").value.trim(),password=$("password").value;
@@ -131,9 +147,50 @@ async function createFolder(){
   const name=$("folderNameInput").value.trim();
   if(!name)return toast("Digite um nome para a pasta.");
   if(folders.some(f=>f.name.toLowerCase()===name.toLowerCase()))return toast("Essa pasta já existe.");
-  const {data,error}=await client.from("album_folders").insert({user_id:currentUser.id,name}).select().single();
-  if(error)return toast(authError(error));
-  folders.push(data);currentFolder=data.id;closeFolderModal();renderFolders();renderGallery();toast("Pasta criada!");
+  if(!driveReady())return toast("Conecte o Google Drive primeiro.");
+  const root=await ensureDriveRoot();
+  if(!root)return;
+  const meta={name,mimeType:"application/vnd.google-apps.folder",parents:[root]};
+  const res=await driveFetch("https://www.googleapis.com/drive/v3/files?fields=id,name,mimeType",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(meta)});
+  if(!res.ok)return toast("Não foi possível criar a pasta no Google Drive.");
+  const data=await res.json();
+  const {data:db,error}=await client.from("album_folders").insert({user_id:currentUser.id,name}).select().single();
+  if(error){await driveFetch("https://www.googleapis.com/drive/v3/files/"+encodeURIComponent(data.id),{method:"DELETE"});return toast(authError(error));}
+  folders.push({...db,drive_id:data.id});currentFolder=db.id;closeFolderModal();renderFolders();renderGallery();toast("Pasta criada no Google Drive!");
+}
+
+async function driveFetch(url,opts={}){
+  if(!googleAccessToken){requestDriveAccess();throw new Error("Google Drive não conectado.")}
+  const headers=new Headers(opts.headers||{});headers.set("Authorization","Bearer "+googleAccessToken);
+  const r=await fetch(url,{...opts,headers});
+  if(r.status===401){googleAccessToken=null;setDriveButton();toast("A autorização do Google expirou. Conecte o Drive novamente.");}
+  return r;
+}
+async function ensureDriveRoot(){
+  if(driveRootId)return driveRootId;
+  const q=`name='${DRIVE_ROOT_NAME.replace(/'/g,"\\'")}' and mimeType='application/vnd.google-apps.folder' and trashed=false and 'root' in parents`;
+  const r=await driveFetch("https://www.googleapis.com/drive/v3/files?spaces=drive&q="+encodeURIComponent(q)+"&fields=files(id,name)");
+  if(!r.ok)return null;
+  const j=await r.json();
+  if(j.files?.length){driveRootId=j.files[0].id;return driveRootId}
+  const c=await driveFetch("https://www.googleapis.com/drive/v3/files?fields=id,name",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:DRIVE_ROOT_NAME,mimeType:"application/vnd.google-apps.folder"})});
+  if(!c.ok)return null;const d=await c.json();driveRootId=d.id;return driveRootId;
+}
+async function driveFolderMap(){
+  const root=await ensureDriveRoot();if(!root)return {};
+  const r=await driveFetch("https://www.googleapis.com/drive/v3/files?spaces=drive&q="+encodeURIComponent("'"+root+"' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false")+"&fields=files(id,name)");
+  if(!r.ok)return {};const j=await r.json();const map={};(j.files||[]).forEach(f=>map[f.name]=f.id);return map;
+}
+async function ensureDriveFolder(folderId){
+  if(folderId==="general")return ensureDriveRoot();
+  const f=folders.find(x=>x.id===folderId);if(!f)return ensureDriveRoot();
+  if(f.drive_id)return f.drive_id;
+  const map=await driveFolderMap();if(map[f.name]){f.drive_id=map[f.name];return f.drive_id}
+  return ensureDriveRoot();
+}
+async function fetchDriveImage(fileId){
+  const r=await driveFetch("https://www.googleapis.com/drive/v3/files/"+encodeURIComponent(fileId)+"?alt=media");
+  if(!r.ok)return null;const blob=await r.blob();return URL.createObjectURL(blob);
 }
 
 async function loadData(){
@@ -143,6 +200,7 @@ async function loadData(){
   ]);
   if(fRes.error||pRes.error){toast(authError(fRes.error||pRes.error));return}
   folders=fRes.data||[];photos=pRes.data||[];
+  if(googleAccessToken){const map=await driveFolderMap();folders.forEach(f=>{if(map[f.name])f.drive_id=map[f.name]})}
   renderFolders();await renderGallery();
 }
 
@@ -165,9 +223,10 @@ async function renderGallery(){
   $("deleteFolderBtn").classList.toggle("hidden",currentFolder==="all");
   if(!visible.length){$("gallery").innerHTML='<div class="empty"><div class="emoji">☁️</div><h3>Nenhuma foto por aqui</h3><p>Adicione fotos para salvá-las na nuvem.</p></div>';return}
   $("gallery").innerHTML='<div class="photo-grid">'+visible.map(p=>`<article class="photo-card"><div class="photo-wrap"><img id="img-${p.id}" alt="${escapeHtml(p.name)}" data-id="${p.id}"></div><div class="photo-info"><div class="photo-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div><button class="photo-delete" data-delete="${p.id}" title="Remover">🗑</button></div></article>`).join("")+"</div>";
+  if(!driveReady()){toast("Conecte o Google Drive para visualizar suas fotos.");return}
   for(const p of visible){
-    const {data,error}=await client.storage.from(BUCKET).createSignedUrl(p.storage_path,3600);
-    if(!error&&data?.signedUrl){const img=$("img-"+p.id);if(img)img.src=data.signedUrl}
+    const src=await fetchDriveImage(p.storage_path);
+    if(src){const img=$("img-"+p.id);if(img)img.src=src}
   }
   document.querySelectorAll("[data-delete]").forEach(b=>b.onclick=()=>deletePhoto(b.dataset.delete));
   document.querySelectorAll(".photo-wrap img").forEach(i=>i.onclick=()=>openLightbox(i.src,i.alt));
@@ -180,12 +239,17 @@ $("fileInput").onchange=async e=>{
   $("uploadProgress").classList.add("show");let done=0;
   for(const file of files){
     try{
-      const id=uid(),ext=(file.name.split(".").pop()||"jpg").toLowerCase().replace(/[^a-z0-9]/g,"")||"jpg";
-      const storagePath=`${currentUser.id}/${folderId||"general"}/${id}.${ext}`;
-      const up=await client.storage.from(BUCKET).upload(storagePath,file,{contentType:file.type,upsert:false});
-      if(up.error)throw up.error;
-      const ins=await client.from("album_photos").insert({user_id:currentUser.id,folder_id:folderId,name:file.name,storage_path:storagePath,mime_type:file.type}).select().single();
-      if(ins.error){await client.storage.from(BUCKET).remove([storagePath]);throw ins.error}
+      if(!driveReady())throw new Error("Conecte o Google Drive primeiro.");
+      const parent=await ensureDriveFolder(folderId||"general");
+      if(!parent)throw new Error("Não foi possível localizar a pasta do Google Drive.");
+      const metadata={name:file.name,parents:[parent]};
+      const boundary="----MeuAlbum"+uid();
+      const body=new Blob(["--"+boundary+"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"+JSON.stringify(metadata)+"\r\n--"+boundary+"\r\nContent-Type: "+file.type+"\r\n\r\n",file,"\r\n--"+boundary+"--"],{type:"multipart/related; boundary="+boundary});
+      const up=await driveFetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType",{method:"POST",headers:{"Content-Type":"multipart/related; boundary="+boundary},body});
+      if(!up.ok)throw new Error("Falha no upload para o Google Drive.");
+      const driveFile=await up.json();
+      const ins=await client.from("album_photos").insert({user_id:currentUser.id,folder_id:folderId,name:file.name,storage_path:driveFile.id,mime_type:file.type}).select().single();
+      if(ins.error){await driveFetch("https://www.googleapis.com/drive/v3/files/"+encodeURIComponent(driveFile.id),{method:"DELETE"});throw ins.error}
       photos.unshift(ins.data);done++;$("uploadProgress").firstElementChild.style.width=(done/files.length*100)+"%";
     }catch(err){toast("Erro ao enviar "+file.name+": "+authError(err))}
   }
@@ -196,8 +260,8 @@ $("fileInput").onchange=async e=>{
 async function deletePhoto(id){
   const p=photos.find(x=>x.id===id);if(!p)return;
   if(!confirm(`Remover "${p.name}" da nuvem?`))return;
-  const r=await client.storage.from(BUCKET).remove([p.storage_path]);
-  if(r.error)return toast(authError(r.error));
+  const r=await driveFetch("https://www.googleapis.com/drive/v3/files/"+encodeURIComponent(p.storage_path),{method:"DELETE"});
+  if(!r.ok&&r.status!==404)return toast("Não foi possível remover a foto do Google Drive.");
   const d=await client.from("album_photos").delete().eq("id",id);
   if(d.error)return toast(authError(d.error));
   photos=photos.filter(x=>x.id!==id);renderFolders();renderGallery();toast("Foto removida.");
@@ -207,7 +271,9 @@ $("deleteFolderBtn").onclick=async()=>{
   const f=folders.find(x=>x.id===currentFolder);if(!f)return;
   const ps=photos.filter(p=>p.folder_id===currentFolder);
   if(!confirm(`Excluir "${f.name}" e suas ${ps.length} fotos?`))return;
-  for(const p of ps)await client.storage.from(BUCKET).remove([p.storage_path]);
+  for(const p of ps){const r=await driveFetch("https://www.googleapis.com/drive/v3/files/"+encodeURIComponent(p.storage_path),{method:"DELETE"});if(!r.ok&&r.status!==404)return toast("Não foi possível remover todas as fotos do Google Drive.")}
+  const fDrive=folders.find(x=>x.id===currentFolder)?.drive_id;
+  if(fDrive)await driveFetch("https://www.googleapis.com/drive/v3/files/"+encodeURIComponent(fDrive),{method:"DELETE"});
   const d=await client.from("album_photos").delete().eq("folder_id",currentFolder);
   if(d.error)return toast(authError(d.error));
   const d2=await client.from("album_folders").delete().eq("id",currentFolder);
@@ -224,6 +290,7 @@ async function boot(){
     showAuth("Antes de usar o álbum, configure SUPABASE_URL e SUPABASE_PUBLISHABLE_KEY no arquivo HTML.");
     $("signInBtn").disabled=true;$("showSignUpBtn").disabled=true;return;
   }
+  setDriveButton();
   const {data}=await client.auth.getSession();
   if(data.session){currentUser=data.session.user;showApp();await loadData()}else showAuth("");
   client.auth.onAuthStateChange(async(_event,session)=>{
@@ -234,4 +301,4 @@ async function boot(){
 boot();
 </script>
 </body>
-</html>
+  </html>
